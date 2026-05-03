@@ -1,5 +1,5 @@
 [build-system]
-    requires = ["setuptools>=64"]
+    requires = ["setuptools>=64", "cffi>=1.15"]
     build-backend = "setuptools.build_meta"
 
 [project]
@@ -33,6 +33,7 @@
 
     dependencies = [
         "bitstring>=3.1.6,!=4.2.0",
+        "cffi>=1.15",
         "cryptography>=43.0.0",
         "pyserial>=3.3",
         "reedsolo>=1.5.3,<1.8",
@@ -67,6 +68,7 @@
 
 [tool.setuptools]
     include-package-data = true
+    cffi_modules = ["esptool/_esf_build.py:ffi"]
 
 [tool.setuptools.package-data]
     "*" = ["esptool/targets/stub_flasher/1/*", "esptool/targets/stub_flasher/2/*"]

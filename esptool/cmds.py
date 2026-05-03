@@ -131,6 +131,13 @@ def detect_chip(
     Returns:
         An initialized instance of the detected chip class ready for use.
     """
+    if os.environ.get("ESPTOOL_ESF"):
+        from ._esf_backend import ESFLoader
+
+        loader = ESFLoader(port, baud)
+        loader.connect(connect_mode, connect_attempts)
+        return loader  # type: ignore[return-value]
+
     inst = None
     detect_port = ESPLoader(port, baud, trace_enabled=trace_enabled)
     if detect_port.serial_port.startswith("rfc2217:"):
