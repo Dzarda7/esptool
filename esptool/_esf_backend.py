@@ -10,15 +10,17 @@ serial protocol level.  It calls into esp-serial-flasher via cffi — no
 pyserial, no Python-level SLIP framing, no stub upload logic.
 """
 
+import importlib
+
 from .logger import log
-from .util import FatalError
+from .util import FatalError, NotSupportedError
 
 # ---------------------------------------------------------------------------
 # Lazy-load the compiled cffi extension.
 # ---------------------------------------------------------------------------
 
 try:
-    from . import _esf as _ext
+    _ext = importlib.import_module("esptool._esf")
 
     _ffi = _ext.ffi
     _lib = _ext.lib
@@ -49,6 +51,17 @@ _CONNECT_SYNC_TIMEOUT_MS = 100
 _CONNECT_TRIALS = 7
 
 
+class _PortCompat:
+    def __init__(self, port):
+        self.port = port
+
+    def close(self):
+        pass
+
+    def open(self):
+        pass
+
+
 def _check(err, msg="ESF error"):
     if err != _lib.ESP_LOADER_SUCCESS:
         raise FatalError(f"{msg}: error code {int(err)}")
@@ -68,6 +81,11 @@ class ESFLoader:
 
     IS_STUB = True
     FLASH_WRITE_SIZE = 0x4000  # stub default; matches StubMixin
+    FLASH_SECTOR_SIZE = 0x1000
+    FLASH_ENCRYPTED_WRITE_ALIGN = 16
+    WRITE_FLASH_ATTEMPTS = 3
+    BOOTLOADER_FLASH_OFFSET = 0x1000
+    ESP_IMAGE_MAGIC = 0xE9
 
     def __init__(self, port, baud=115200):
         if not _ESF_AVAILABLE:
@@ -78,6 +96,9 @@ class ESFLoader:
 
         self._port_str = port if isinstance(port, str) else port.decode()
         self._baud = baud
+        self._port = _PortCompat(self._port_str)
+        self.secure_download_mode = False
+        self.stub_is_disabled = False
 
         # Allocate C structs; cffi computes sizes from the compiled headers.
         self._port_cdata = _ffi.new("esf_port_t *")
@@ -85,6 +106,8 @@ class ESFLoader:
 
         # Keep the device string alive as long as the loader is open.
         self._device_cstr = _ffi.new("char[]", self._port_str.encode() + b"\x00")
+        self._flash_cfg = None
+        self._flash_defl_cfg = None
 
         _check(
             _lib._esf_open(
@@ -133,18 +156,88 @@ class ESFLoader:
     def serial_port(self):
         return self._port_str
 
+    def get_chip_description(self):
+        return self.CHIP_NAME
+
+    def get_chip_features(self):
+        return []
+
+    def get_crystal_freq(self):
+        return 40
+
+    def get_usb_mode(self):
+        return None
+
+    def get_usb_vid_pid(self):
+        return (None, None)
+
+    def get_secure_boot_enabled(self):
+        return False
+
+    def get_secure_boot_v1_enabled(self):
+        return False
+
+    def get_flash_encryption_enabled(self):
+        return False
+
+    def get_encrypted_download_disabled(self):
+        return False
+
+    def get_flash_crypt_config(self):
+        return None
+
+    def is_flash_encryption_key_valid(self):
+        return True
+
+    def uses_key_manager_for_flash_encryption(self):
+        return False
+
+    def read_spiflash_sfdp(self, addr, size):
+        return 0
+
+    def run_spiflash_command(self, *args, **kwargs):
+        return 0
+
+    def flash_type(self):
+        return None
+
+    def flash_set_parameters(self, size):
+        pass
+
+    def flash_md5sum(self, address, size):
+        raise NotSupportedError(self, "flash_md5sum")
+
+    def flash_verify_known_md5(self, address, size, expected_md5):
+        expected = expected_md5.encode("ascii")
+        buf = _ffi.from_buffer(expected)
+        _check(
+            _lib.esp_loader_flash_verify_known_md5(
+                self._loader_cdata, address, size, buf
+            ),
+            "Flash MD5 verification failed",
+        )
+
+    def get_flash_voltage(self):
+        raise NotSupportedError(self, "get_flash_voltage")
+
+    def chip_id(self):
+        raise NotSupportedError(self, "chip_id")
+
+    def run_stub(self, stub=None):
+        return self
+
     # ------------------------------------------------------------------
     # Flash write
     # ------------------------------------------------------------------
 
     def flash_begin(self, size, offset, encrypted_write=False, logging=True):
-        cfg = _ffi.new("esp_loader_flash_cfg_t *")
-        cfg.offset = offset
-        cfg.image_size = size
-        cfg.block_size = self.FLASH_WRITE_SIZE
-        cfg.skip_verify = False
+        self._flash_cfg = _ffi.new("esp_loader_flash_cfg_t *")
+        self._flash_cfg.offset = offset
+        self._flash_cfg.image_size = size
+        self._flash_cfg.block_size = self.FLASH_WRITE_SIZE
+        self._flash_cfg.skip_verify = True
         _check(
-            _lib.esp_loader_flash_start(self._loader_cdata, cfg),
+            _lib.esp_loader_flash_start(self._loader_cdata, self._flash_cfg),
             "Failed to begin flash write",
         )
         return (size + self.FLASH_WRITE_SIZE - 1) // self.FLASH_WRITE_SIZE
@@ -152,29 +245,35 @@ class ESFLoader:
     def flash_block(self, data, seq, timeout=None, encrypted=False):
         buf = _ffi.from_buffer(data)
         _check(
-            _lib.esp_loader_flash_write(self._loader_cdata, buf, len(data)),
+            _lib.esp_loader_flash_write(
+                self._loader_cdata, self._flash_cfg, buf, len(data)
+            ),
             f"Failed to write flash block {seq}",
         )
 
     def flash_finish(self, reboot=False, timeout=None):
         _check(
-            _lib.esp_loader_flash_finish(self._loader_cdata, reboot),
+            _lib.esp_loader_flash_finish(self._loader_cdata, self._flash_cfg),
             "Failed to finish flash write",
         )
+        self._flash_cfg = None
+        if reboot:
+            self.hard_reset()
 
     # ------------------------------------------------------------------
     # Compressed flash write
     # ------------------------------------------------------------------
 
     def flash_defl_begin(self, size, compsize, offset, encrypted_write=False):
-        cfg = _ffi.new("esp_loader_flash_deflate_cfg_t *")
-        cfg.offset = offset
-        cfg.uncompressed_size = size
-        cfg.compressed_size = compsize
-        cfg.block_size = self.FLASH_WRITE_SIZE
-        cfg.skip_verify = False
+        self._flash_defl_cfg = _ffi.new("esp_loader_flash_deflate_cfg_t *")
+        self._flash_defl_cfg.offset = offset
+        self._flash_defl_cfg.image_size = size
+        self._flash_defl_cfg.compressed_size = compsize
+        self._flash_defl_cfg.block_size = self.FLASH_WRITE_SIZE
         _check(
-            _lib.esp_loader_flash_deflate_start(self._loader_cdata, cfg),
+            _lib.esp_loader_flash_deflate_start(
+                self._loader_cdata, self._flash_defl_cfg
+            ),
             "Failed to begin compressed flash write",
         )
         return (compsize + self.FLASH_WRITE_SIZE - 1) // self.FLASH_WRITE_SIZE
@@ -182,15 +281,22 @@ class ESFLoader:
     def flash_defl_block(self, data, seq, timeout=None):
         buf = _ffi.from_buffer(data)
         _check(
-            _lib.esp_loader_flash_deflate_write(self._loader_cdata, buf, len(data)),
+            _lib.esp_loader_flash_deflate_write(
+                self._loader_cdata, self._flash_defl_cfg, buf, len(data)
+            ),
             f"Failed to write compressed flash block {seq}",
         )
 
     def flash_defl_finish(self, reboot=False, timeout=None):
         _check(
-            _lib.esp_loader_flash_deflate_finish(self._loader_cdata, reboot),
+            _lib.esp_loader_flash_deflate_finish(
+                self._loader_cdata, self._flash_defl_cfg
+            ),
             "Failed to finish compressed flash write",
         )
+        self._flash_defl_cfg = None
+        if reboot:
+            self.hard_reset()
 
     # ------------------------------------------------------------------
     # Erase
@@ -215,7 +321,7 @@ class ESFLoader:
     def read_flash(self, offset, length, progress_fn=None):
         buf = _ffi.new("uint8_t[]", length)
         _check(
-            _lib.esp_loader_flash_read(self._loader_cdata, offset, buf, length),
+            _lib.esp_loader_flash_read(self._loader_cdata, buf, offset, length),
             f"Failed to read flash at {offset:#x}",
         )
         data = bytes(_ffi.buffer(buf, length))
@@ -224,12 +330,12 @@ class ESFLoader:
         return data
 
     def flash_id(self, cache=True):
-        size_p = _ffi.new("uint32_t *")
+        flash_id_p = _ffi.new("uint32_t *")
         _check(
-            _lib.esp_loader_flash_detect_size(self._loader_cdata, size_p),
-            "Failed to detect flash size",
+            _lib._esf_flash_id(self._loader_cdata, flash_id_p),
+            "Failed to read flash ID",
         )
-        return int(size_p[0])
+        return int(flash_id_p[0])
 
     # ------------------------------------------------------------------
     # Baud rate
@@ -238,7 +344,9 @@ class ESFLoader:
     def change_baud(self, baud):
         log.print(f"Changing baud rate to {baud}...")
         _check(
-            _lib.esp_loader_change_transmission_rate_stub(self._loader_cdata, baud),
+            _lib.esp_loader_change_transmission_rate_stub(
+                self._loader_cdata, self._baud, baud
+            ),
             f"Failed to change baud rate to {baud}",
         )
         self._baud = baud

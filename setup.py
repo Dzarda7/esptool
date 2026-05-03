@@ -32,4 +32,5 @@ else:
 setup(
     scripts=scripts,
     entry_points=entry_points,
+    cffi_modules=["esptool/_esf_build.py:ffi"],
 )

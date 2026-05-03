@@ -59,14 +59,15 @@ ffi.cdef("""
         uint32_t image_size;
         uint32_t block_size;
         _Bool    skip_verify;
+        ...;
     } esp_loader_flash_cfg_t;
 
     typedef struct {
         uint32_t offset;
-        uint32_t uncompressed_size;
+        uint32_t image_size;
         uint32_t compressed_size;
         uint32_t block_size;
-        _Bool    skip_verify;
+        ...;
     } esp_loader_flash_deflate_cfg_t;
 
     /* ---- opaque internal contexts ------------------------------------ */
@@ -78,6 +79,8 @@ ffi.cdef("""
                                   esp_loader_t *loader,
                                   const char   *device,
                                   unsigned      baudrate);
+
+    esp_loader_error_t _esf_flash_id(esp_loader_t *loader, uint32_t *flash_id);
 
     /* ---- connection -------------------------------------------------- */
     esp_loader_error_t esp_loader_connect(
@@ -95,20 +98,22 @@ ffi.cdef("""
         esp_loader_t *loader, esp_loader_flash_cfg_t *cfg);
 
     esp_loader_error_t esp_loader_flash_write(
-        esp_loader_t *loader, void *payload, uint32_t size);
+        esp_loader_t *loader, esp_loader_flash_cfg_t *cfg,
+        void *payload, uint32_t size);
 
     esp_loader_error_t esp_loader_flash_finish(
-        esp_loader_t *loader, _Bool reboot);
+        esp_loader_t *loader, esp_loader_flash_cfg_t *cfg);
 
     /* ---- compressed flash write -------------------------------------- */
     esp_loader_error_t esp_loader_flash_deflate_start(
         esp_loader_t *loader, esp_loader_flash_deflate_cfg_t *cfg);
 
     esp_loader_error_t esp_loader_flash_deflate_write(
-        esp_loader_t *loader, void *payload, uint32_t size);
+        esp_loader_t *loader, esp_loader_flash_deflate_cfg_t *cfg,
+        void *payload, uint32_t size);
 
     esp_loader_error_t esp_loader_flash_deflate_finish(
-        esp_loader_t *loader, _Bool reboot);
+        esp_loader_t *loader, esp_loader_flash_deflate_cfg_t *cfg);
 
     /* ---- erase ------------------------------------------------------- */
     esp_loader_error_t esp_loader_flash_erase(esp_loader_t *loader);
@@ -118,18 +123,22 @@ ffi.cdef("""
 
     /* ---- flash read -------------------------------------------------- */
     esp_loader_error_t esp_loader_flash_read(
-        esp_loader_t *loader, uint32_t offset,
-        uint8_t *buf, uint32_t size);
+        esp_loader_t *loader, uint8_t *buf,
+        uint32_t offset, uint32_t size);
 
     esp_loader_error_t esp_loader_flash_detect_size(
         esp_loader_t *loader, uint32_t *flash_size);
+
+    esp_loader_error_t esp_loader_flash_verify_known_md5(
+        esp_loader_t *loader, uint32_t address,
+        uint32_t size, const uint8_t *expected_md5);
 
     /* ---- baud rate --------------------------------------------------- */
     esp_loader_error_t esp_loader_change_transmission_rate(
         esp_loader_t *loader, uint32_t rate);
 
     esp_loader_error_t esp_loader_change_transmission_rate_stub(
-        esp_loader_t *loader, uint32_t rate);
+        esp_loader_t *loader, uint32_t old_rate, uint32_t new_rate);
 
     /* ---- register access --------------------------------------------- */
     esp_loader_error_t esp_loader_read_register(
@@ -171,6 +180,8 @@ _sources = [
     _esf_src("src", "esp_loader.c"),
     _esf_src("src", "protocol_serial.c"),
     _esf_src("src", "protocol_uart.c"),
+    _esf_src("src", "protocol_spi.c"),
+    _esf_src("src", "protocol_sdio.c"),
     _esf_src("src", "slip.c"),
     _esf_src("src", "esp_targets.c"),
     _esf_src("src", "md5_hash.c"),
@@ -200,7 +211,11 @@ _include_dirs = [
     _port,
 ]
 
-_extra_compile_args = [] if sys.platform == "win32" else ["-std=c11"]
+_extra_compile_args = ["-DSERIAL_FLASHER_WRITE_BLOCK_RETRIES=3"]
+if sys.platform != "win32":
+    _extra_compile_args.extend(
+        ["-D_POSIX_C_SOURCE=200809L", "-D_DEFAULT_SOURCE", "-std=c11"]
+    )
 _libraries = ["advapi32"] if sys.platform == "win32" else []
 
 ffi.set_source(
@@ -210,6 +225,7 @@ ffi.set_source(
     #include <stdbool.h>
     #include "esp_loader.h"
     #include "esp_loader_error.h"
+    #include "esp_targets.h"
     #include "esf_port.h"
 
     /*
@@ -226,6 +242,107 @@ ffi.set_source(
         port->device   = device;
         port->baudrate = baudrate;
         return esp_loader_init_uart(loader, &port->port);
+    }
+
+    static esp_loader_error_t _esf_spi_set_lengths(esp_loader_t *loader,
+                                                   uint32_t mosi_bits,
+                                                   uint32_t miso_bits)
+    {
+        if (loader->_target == ESP8266_CHIP) {
+            uint32_t mosi_mask = (mosi_bits == 0) ? 0 : mosi_bits - 1;
+            uint32_t miso_mask = (miso_bits == 0) ? 0 : miso_bits - 1;
+            return esp_loader_write_register(
+                loader, loader->_reg->usr1, (miso_mask << 8) | (mosi_mask << 17));
+        }
+
+        if (mosi_bits > 0) {
+            esp_loader_error_t err = esp_loader_write_register(
+                loader, loader->_reg->mosi_dlen, mosi_bits - 1);
+            if (err != ESP_LOADER_SUCCESS) {
+                return err;
+            }
+        }
+        if (miso_bits > 0) {
+            esp_loader_error_t err = esp_loader_write_register(
+                loader, loader->_reg->miso_dlen, miso_bits - 1);
+            if (err != ESP_LOADER_SUCCESS) {
+                return err;
+            }
+        }
+        return ESP_LOADER_SUCCESS;
+    }
+
+    esp_loader_error_t _esf_flash_id(esp_loader_t *loader, uint32_t *flash_id)
+    {
+        uint32_t flash_size;
+        esp_loader_error_t err = esp_loader_flash_detect_size(loader, &flash_size);
+        if (err != ESP_LOADER_SUCCESS) {
+            return err;
+        }
+
+        const uint32_t SPI_USR_CMD = (1u << 31);
+        const uint32_t SPI_USR_MISO = (1u << 28);
+        const uint32_t SPI_CMD_USR = (1u << 18);
+        const uint32_t CMD_LEN_SHIFT = 28;
+        const uint32_t SPI_FLASH_READ_ID = 0x9F;
+
+        uint32_t old_spi_usr;
+        uint32_t old_spi_usr2;
+        err = esp_loader_read_register(loader, loader->_reg->usr, &old_spi_usr);
+        if (err != ESP_LOADER_SUCCESS) {
+            return err;
+        }
+        err = esp_loader_read_register(loader, loader->_reg->usr2, &old_spi_usr2);
+        if (err != ESP_LOADER_SUCCESS) {
+            return err;
+        }
+
+        err = _esf_spi_set_lengths(loader, 0, 24);
+        if (err != ESP_LOADER_SUCCESS) {
+            return err;
+        }
+        err = esp_loader_write_register(
+            loader, loader->_reg->usr, SPI_USR_CMD | SPI_USR_MISO);
+        if (err != ESP_LOADER_SUCCESS) {
+            return err;
+        }
+        err = esp_loader_write_register(
+            loader, loader->_reg->usr2, (7u << CMD_LEN_SHIFT) | SPI_FLASH_READ_ID);
+        if (err != ESP_LOADER_SUCCESS) {
+            return err;
+        }
+        err = esp_loader_write_register(loader, loader->_reg->w0, 0);
+        if (err != ESP_LOADER_SUCCESS) {
+            return err;
+        }
+        err = esp_loader_write_register(loader, loader->_reg->cmd, SPI_CMD_USR);
+        if (err != ESP_LOADER_SUCCESS) {
+            return err;
+        }
+
+        for (uint32_t trials = 10; trials > 0; --trials) {
+            uint32_t cmd_reg;
+            err = esp_loader_read_register(loader, loader->_reg->cmd, &cmd_reg);
+            if (err != ESP_LOADER_SUCCESS) {
+                return err;
+            }
+            if ((cmd_reg & SPI_CMD_USR) == 0) {
+                break;
+            }
+            if (trials == 1) {
+                return ESP_LOADER_ERROR_TIMEOUT;
+            }
+        }
+
+        err = esp_loader_read_register(loader, loader->_reg->w0, flash_id);
+        if (err != ESP_LOADER_SUCCESS) {
+            return err;
+        }
+        err = esp_loader_write_register(loader, loader->_reg->usr, old_spi_usr);
+        if (err != ESP_LOADER_SUCCESS) {
+            return err;
+        }
+        return esp_loader_write_register(loader, loader->_reg->usr2, old_spi_usr2);
     }
     """,
     sources=_sources,
