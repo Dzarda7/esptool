@@ -68,7 +68,6 @@
 
 [tool.setuptools]
     include-package-data = true
-    cffi_modules = ["esptool/_esf_build.py:ffi"]
 
 [tool.setuptools.package-data]
     "*" = ["esptool/targets/stub_flasher/1/*", "esptool/targets/stub_flasher/2/*"]

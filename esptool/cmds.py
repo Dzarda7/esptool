@@ -1556,7 +1556,11 @@ def write_flash(
             log.print("Verifying written data...")
             if not encrypted and not esp.secure_download_mode:
                 try:
-                    res = esp.flash_md5sum(base_address, base_size)
+                    if hasattr(esp, "flash_verify_known_md5"):
+                        esp.flash_verify_known_md5(base_address, base_size, image_md5)
+                        res = image_md5
+                    else:
+                        res = esp.flash_md5sum(base_address, base_size)
                     log.stage(finish=True)
                     if res != image_md5:
                         if was_reflashing:
@@ -2474,6 +2478,9 @@ def run_stub(esp: ESPLoader, plugins: list[str] | None = None) -> ESPLoader:
         where the stub has been executed, or in its original state
         if the stub loader is disabled or unsupported.
     """
+    if esp.IS_STUB:
+        return esp
+
     if esp.secure_download_mode:
         log.warning(
             "Stub flasher is not supported in Secure Download Mode, "
